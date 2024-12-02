@@ -163,12 +163,15 @@ class WaveNetModel(nn.Module):
         return x
 
     def queue_dilate(self, input, dilation, init_dilation, i):
-        queue = self.dilated_queues[i]
-        queue.enqueue(input.data[0])
-        x = queue.dequeue(num_deq=self.kernel_size,
-                         dilation=dilation)
-        x = x.unsqueeze(0)
-        return x
+      queue = self.dilated_queues[i]
+      if input.dim() == 3:
+          queue.enqueue(input.data[0])  # First batch item
+      else:
+          queue.enqueue(input.data)
+      x = queue.dequeue(num_deq=self.kernel_size,
+                      dilation=dilation)
+      x = x.unsqueeze(0)
+      return x
 
     def forward(self, input):
         x = self.wavenet(input, dilation_func=self.wavenet_dilate)
@@ -216,71 +219,64 @@ class WaveNetModel(nn.Module):
         self.train()
         return mu_gen
 
-    def generate_fast(self, num_samples, first_samples=None, temperature=1., regularize=0.,
-                     progress_callback=None, progress_interval=100):
-        self.eval()
-        with torch.no_grad():
-            if first_samples is None:
-                first_samples = torch.zeros(1, dtype=torch.long, device=self.start_conv.weight.device) + (self.classes // 2)
+    def generate_fast(self, num_samples, first_samples=None, temperature=1.,
+                 regularize=0., progress_callback=None, progress_interval=100):
+      self.eval()
+      with torch.no_grad():
+          if first_samples is None:
+              first_samples = torch.zeros(1, dtype=torch.long, device=self.start_conv.weight.device) + (self.classes // 2)
 
-            # reset queues
-            for queue in self.dilated_queues:
-                queue.reset()
+          # reset queues
+          for queue in self.dilated_queues:
+              queue.reset()
 
-            num_given_samples = first_samples.size(0)
-            total_samples = num_given_samples + num_samples
+          num_given_samples = first_samples.size(0)
+          total_samples = num_given_samples + num_samples
 
-            input = torch.zeros(1, self.classes, 1, device=self.start_conv.weight.device)
-            input = input.scatter_(1, first_samples[0:1].view(1, -1, 1), 1.)
+          input = torch.zeros(1, self.classes, 1, device=self.start_conv.weight.device)
+          input = input.scatter_(1, first_samples[0:1].view(1, -1, 1), 1.)
 
-            # fill queues with given samples
-            for i in range(num_given_samples - 1):
-                x = self.wavenet(input, dilation_func=self.queue_dilate)
-                input.zero_()
-                input = input.scatter_(1, first_samples[i + 1:i + 2].view(1, -1, 1), 1.).view(1, self.classes, 1)
+          # fill queues with given samples
+          for i in range(num_given_samples - 1):
+              x = self.wavenet(input, dilation_func=self.queue_dilate)
+              input.zero_()
+              input = input.scatter_(1, first_samples[i + 1:i + 2].view(1, -1, 1), 1.).view(1, self.classes, 1)
 
-                if i % progress_interval == 0 and progress_callback is not None:
-                    progress_callback(i, total_samples)
+              if i % progress_interval == 0 and progress_callback is not None:
+                  progress_callback(i, total_samples)
 
-            # generate new samples
-            generated = np.array([])
-            regularizer = torch.arange(self.classes, device=self.start_conv.weight.device)
-            regularizer = torch.pow(regularizer - self.classes / 2., 2) * regularize
+          # generate new samples
+          generated = np.array([])
+          regularizer = torch.pow(torch.arange(self.classes, device=self.start_conv.weight.device, dtype=torch.float) - self.classes / 2., 2)
+          regularizer = regularizer.squeeze() * regularize
 
-            tic = time.time()
-            for i in range(num_samples):
-                x = self.wavenet(input, dilation_func=self.queue_dilate).squeeze()
-                x = x - regularizer
+          for i in range(num_samples):
+              x = self.wavenet(input, dilation_func=self.queue_dilate).squeeze()
+              x = x - regularizer
 
-                if temperature > 0:
-                    # sample from softmax distribution
-                    x /= temperature
-                    prob = F.softmax(x, dim=0)
-                    prob = prob.cpu().numpy()
-                    x = np.random.choice(self.classes, p=prob)
-                    x = np.array([x])
-                else:
-                    # convert to sample value
-                    x = torch.argmax(x, dim=0).cpu().numpy()
+              if temperature > 0:
+                  # sample from softmax distribution
+                  x /= temperature
+                  prob = F.softmax(x, dim=0)
+                  prob = prob.cpu().numpy()
+                  x = np.random.choice(self.classes, p=prob)
+                  x = np.array([x])
+              else:
+                  # convert to sample value
+                  x = torch.argmax(x, dim=0).cpu().numpy()
 
-                o = (x / self.classes) * 2. - 1
-                generated = np.append(generated, o)
+              o = (x / self.classes) * 2. - 1
+              generated = np.append(generated, o)
 
-                # set new input
-                x = torch.from_numpy(x).to(device=self.start_conv.weight.device, dtype=torch.long)
-                input.zero_()
-                input = input.scatter_(1, x.view(1, -1, 1), 1.).view(1, self.classes, 1)
+              # set new input
+              x = torch.tensor([x], device=self.start_conv.weight.device, dtype=torch.long)
+              input.zero_()
+              input = input.scatter_(1, x.view(1, -1, 1), 1.).view(1, self.classes, 1)
 
-                if (i + 1) == 100:
-                    toc = time.time()
-                    print(f"one generating step takes approximately {(toc - tic) * 0.01:.3f} seconds")
+              if (i + num_given_samples) % progress_interval == 0 and progress_callback is not None:
+                  progress_callback(i + num_given_samples, total_samples)
 
-                if (i + num_given_samples) % progress_interval == 0 and progress_callback is not None:
-                    progress_callback(i + num_given_samples, total_samples)
-
-        self.train()
-        mu_gen = mu_law_expansion(generated, self.classes)
-        return mu_gen
+      return generated
 
     def parameter_count(self):
         return sum(p.numel() for p in self.parameters())

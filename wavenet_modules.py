@@ -67,13 +67,11 @@ class DilatedQueue:
             self.data = torch.zeros(num_channels, max_length)
         else:
             self.data = data
-            
-    def reset(self):
-        self.data = torch.zeros_like(self.data)
-        self.in_pos = 0
-        self.out_pos = 0
 
     def enqueue(self, input):
+        # Handle input dimensions properly
+        if input.dim() == 2:
+            input = input.squeeze(1)  # Remove the second dimension if it exists
         self.data[:, self.in_pos] = input
         self.in_pos = (self.in_pos + 1) % self.max_length
 
@@ -85,11 +83,15 @@ class DilatedQueue:
             t = torch.cat((t1, t2), 1)
         else:
             t = self.data[:, start:self.out_pos + 1:dilation]
-
+        
         self.out_pos = (self.out_pos + 1) % self.max_length
         return t
 
     def to(self, device):
-        """Move the queue data to the specified device."""
         self.data = self.data.to(device)
         return self
+
+    def reset(self):
+        self.data.zero_()
+        self.in_pos = 0
+        self.out_pos = 0
